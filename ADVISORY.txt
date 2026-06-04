@@ -1,0 +1,404 @@
+================================================================================
+SECURITY ADVISORY
+DigiDoc4 Client — TLS certificate validation disabled for LDAPS
+recipient lookup leads to encryption recipient substitution
+================================================================================
+
+CWE:           CWE-295 (Improper Certificate Validation)
+Severity:      High
+CVSS 3.1:      8.0  (AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:L/A:N)
+Affected:      DigiDoc4 Client, all current versions
+               (Linux/macOS code path — Windows uses a separate WinLDAP path
+                that requires independent verification)
+Reporter:      Mark Zelinski
+Contact:       mazeli@taltech.ee
+Disclosure:    Submitted privately to CERT-EE (cert@cert.ee) for
+               forwarding to RIA, because the open-eid/DigiDoc4-Client
+               repository does not have GitHub private vulnerability
+               reporting enabled (/security/advisories/new returns 404).
+Status:        Public — fix released upstream; advisory cleared for publication
+Date:          12.05.2026
+
+
+--------------------------------------------------------------------------------
+1. SUMMARY
+--------------------------------------------------------------------------------
+
+DigiDoc4 Client globally disables peer certificate verification for all
+LDAPS connections on non-Windows platforms by setting
+LDAP_OPT_X_TLS_REQUIRE_CERT = LDAP_OPT_X_TLS_NEVER at startup.
+
+The LDAPS endpoints used to look up recipient certificates for CDOC/CDOC2
+encryption are:
+
+  ldaps://esteid.ldap.sk.ee
+  ldaps://k3.ldap.sk.ee
+  ldaps://ldap.eidpki.ee
+
+An on-path attacker between the user and any of these hosts can:
+
+  1. Present an arbitrary (e.g. self-signed) TLS certificate — accepted.
+  2. Return an attacker-controlled X.509 certificate as the
+     userCertificate;binary attribute for any search.
+  3. The user sees what looks like a valid recipient in the DigiDoc4 UI
+     and encrypts a CDOC under the attacker's public key.
+  4. The attacker decrypts the document with the matching private key.
+
+The intended mitigation for this attack class is TLS server-certificate
+validation; the client explicitly disables it.
+
+
+--------------------------------------------------------------------------------
+2. AFFECTED CODE
+--------------------------------------------------------------------------------
+
+Repository:    https://github.com/open-eid/DigiDoc4-Client
+File:          client/LdapSearch.cpp
+Lines:         124-141
+
+    #ifndef Q_OS_WIN
+    #if 1
+        int cert_flag = LDAP_OPT_X_TLS_NEVER;
+        err = ldap_set_option(nullptr, LDAP_OPT_X_TLS_REQUIRE_CERT, &cert_flag);
+        if(err)
+        {
+            setLastError(tr("Failed to start ssl"), err);
+            return false;
+        }
+    #else
+        err = ldap_set_option(nullptr, LDAP_OPT_X_TLS_CACERTFILE, "");
+        ...
+    #endif
+    #endif
+
+LDAP_OPT_X_TLS_NEVER on a global (NULL handle) ldap_set_option call
+disables peer certificate verification for ALL subsequent LDAPS
+connections from the process. The disabled #else branch in the same
+block confirms this was a deliberate (rather than accidental) decision
+at some point.
+
+
+--------------------------------------------------------------------------------
+3. THREAT MODEL
+--------------------------------------------------------------------------------
+
+The attacker needs an on-path position between the victim's machine and
+the targeted SK LDAP servers. Realistic scenarios:
+
+  - Malicious or shared public Wi-Fi (cafe, hotel, airport, conference).
+  - Compromised home/SOHO router (Mirai, VPNFilter family botnets).
+  - Compromised corporate edge / DNS forwarder.
+  - DNS spoofing on the local network.
+  - Local malware with /etc/hosts modification rights (user level).
+  - Hostile ISP / transit / nation-state on the path to .sk.ee.
+  - Misconfigured corporate TLS-inspection proxy (already accepted CA
+    would NOT exploit this bug specifically, but TLS-inspection on a
+    network the attacker controls would).
+
+These are the threat models TLS validation is designed to defeat.
+DigiDoc4 explicitly forfeits that protection for LDAPS.
+
+The attack does NOT require:
+  - 0-day vulnerabilities
+  - Compromise of any SK infrastructure
+  - User clicking through a security warning (there is none)
+  - Admin/root on the victim machine
+
+
+--------------------------------------------------------------------------------
+4. PROOF OF CONCEPT
+--------------------------------------------------------------------------------
+
+Fully working local PoC included in this submission (directory poc-h1/):
+
+  - Dockerised fake LDAPS server (Python + ldaptor + Twisted).
+  - Generates a self-signed TLS certificate for esteid.ldap.sk.ee.
+  - Mints an attacker leaf certificate ("Mallory") with
+    keyUsage=keyEncipherment and EKU=emailProtection (so it passes the
+    cosmetic filter in AddRecipients::showResult — see Section 6).
+  - /etc/hosts redirects the LDAPS hostnames to 127.0.0.1.
+
+Verified behaviour on macOS:
+
+  Step A — sanity check with a correct LDAPS client:
+    $ LDAPTLS_REQCERT=demand ldapsearch -H ldaps://esteid.ldap.sk.ee \
+        -x -b "c=EE" "(cn=*Mallory*)"
+    → ldap_sasl_bind(SIMPLE): Can't contact LDAP server (-1)
+      (TLS handshake rejected by client — correct behaviour)
+
+  Step B — same connection with verification disabled (mirrors DigiDoc4):
+    $ LDAPTLS_REQCERT=never ldapsearch -H ldaps://esteid.ldap.sk.ee \
+        -x -b "c=EE" "(cn=*Mallory*)"
+    → dn: cn=MALLORY ORG OU,o=MALLORY OU,c=EE
+      userCertificate;binary:: <attacker DER>
+      (Accepts the self-signed TLS cert)
+
+  Step C — DigiDoc4 itself:
+    Open DigiDoc4 → Crypto → Add files → Add recipient → search.
+    "Mallory ORG OU" appears in the result list with valid recipient
+    status. Fake server logs show:
+      [BIND]   dn=b'' version=3
+      [SEARCH] base=b'c=EE' filter='(cn=*MALLORY*)'
+    confirming DigiDoc4 accepted the self-signed TLS handshake.
+
+  Step D — end-to-end (full impact, VERIFIED):
+    User encrypts a real-world document via DigiDoc4 with "Mallory"
+    selected as the recipient (after dismissing the soft "untrusted
+    chain" warning — see Section 6.2). The resulting CDOC1 container
+    is then decrypted using the attacker's locally-generated RSA
+    private key, with a small Python script included in the PoC:
+
+      $ ./decrypt.sh Path_To/secret.cdoc
+      [+] Bulk cipher: AES-256-GCM
+      [+] Decrypted CEK from lock #1 (rsa-oaep-mgf1p)
+      [+] Container MIME: application/zip
+      [+] Extracted (DDOC): decrypted/secret.txt  (NNN bytes)
+
+      $ diff ~/Downloads/secret.txt decrypted/secret.txt
+      (no differences — plaintext recovered byte-for-byte)
+
+    The decryption tool (decrypt.py) depends only on Python 3 and the
+    standard 'cryptography' package; it does NOT use any DigiDoc4 or
+    libdigidocpp/libcdoc binaries. This demonstrates that the bug is
+    exploitable without privileged tooling — anyone with the attacker
+    private key recovers the plaintext in a single command.
+
+    The container exercised was AES-256-GCM with RSA-OAEP-MGF1-SHA1
+    key wrapping (CDOC1 / XML-ENC 1.1), the default format produced
+    by DigiDoc4 with CDOC2-DEFAULT=false (the shipped default).
+
+Full reproduction steps and the decrypt.py source are in poc-h1/.
+
+
+--------------------------------------------------------------------------------
+5. IMPACT
+--------------------------------------------------------------------------------
+
+Confidentiality (HIGH):
+  Any CDOC/CDOC2 encryption flow that selects a recipient via the
+  LDAP-search UI is vulnerable. The encrypted document is fully
+  recoverable by the attacker.
+
+Identity / Trust (MEDIUM):
+  The user perceives the encryption as targeted to a specific
+  individual or organisation; in fact, content is delivered to an
+  attacker-controlled identity. Detection by the end user is
+  practically impossible — the UI shows no warning.
+
+Targeting:
+  An attacker can selectively return the genuine certificate to most
+  users and a forged one to specific targets (e.g. a journalist, civil
+  servant, business counterparty), making detection harder still.
+
+Scope:
+  All DigiDoc4 Client installations on Linux/macOS (verified macOS,
+  Linux uses the same code path).
+
+
+--------------------------------------------------------------------------------
+6. EXISTING DEFENCES — AND WHY THEY ARE NOT SUFFICIENT
+--------------------------------------------------------------------------------
+
+DigiDoc4 has two defence-in-depth checks downstream of the LDAP
+lookup. Neither closes the vulnerability.
+
+6.1 EKU/keyUsage filter (cosmetic, trivially bypassed)
+------------------------------------------------------
+
+  Location: client/dialogs/AddRecipients.cpp lines 309-323
+
+  Filters returned certificates by self-asserted keyUsage and EKU
+  flags before showing them in the search results. This is not a
+  cryptographic check — only the leaf certificate's own bits are
+  inspected.
+
+  An attacker mints a self-signed leaf matching the filter in
+  seconds (the PoC does this — keyUsage=keyEncipherment,
+  EKU=emailProtection only, no clientAuth). This filter is NOT a
+  mitigation.
+
+6.2 "Untrusted chain" warning (click-through, ineffective)
+----------------------------------------------------------
+
+  Location: client/dialogs/AddRecipients.cpp lines 202-215
+
+      QSslConfiguration::setDefaultConfiguration(
+          CheckConnection::sslConfiguration());
+      QList<QSslError> errors =
+          QSslCertificate::verify({key.rcpt_cert});
+      ...
+      if(!errors.isEmpty()) {
+          auto *dlg = WarningDialog::create(this)
+              ->withText(tr("Recipient’s certification chain
+                contains certificates that are not trusted.
+                Continue with encryption?"))
+              ->setCancelText(WarningDialog::NO)
+              ->addButton(WarningDialog::YES, QMessageBox::Yes);
+          if(dlg->exec() != QMessageBox::Yes) return;
+      }
+
+  This IS a real chain validation against the SK PKI trust anchors
+  shipped in CERT-BUNDLE. However:
+
+  (a) It is a soft warning, not a hard block. A single click on
+      "Continue with encryption?" / YES completes the attack.
+
+  (b) It relies on user vigilance, which the security UX
+      literature has repeatedly shown to be unreliable. Browser
+      vendors moved away from one-click "proceed anyway" dialogs
+      precisely because users click through them (Akhawe & Felt
+      2013, "Alice in Warningland"; Reeder et al. 2018, "An
+      Experience Sampling Study of User Reactions to Browser
+      Warnings").
+
+  (c) The warning text is generic and offers no actionable
+      guidance. A user who searched for and saw their expected
+      recipient name in the result list has no UI signal that
+      this could be an MITM-substituted certificate.
+
+  (d) In repeat-encryption workflows (legal practice, accounting,
+      government processing), users develop click-through fatigue.
+
+  Mitigations of this category — a click-through warning replacing
+  cryptographic enforcement — are well-documented as ineffective.
+  The Estonian eID threat model contains adversaries (state-level
+  and otherwise) for whom routing a target's CDOC encryption
+  through a substituted recipient is a realistic operation.
+
+6.3 Realistic attacker capability against the warning
+-----------------------------------------------------
+
+  A motivated attacker does not necessarily need a user click. The
+  warning is dismissed automatically if the leaf certificate chains
+  to a CA that already exists in CERT-BUNDLE. Plausible paths:
+
+    - Impersonation by name collision: a real SK-issued
+      certificate for a different person/entity with a
+      colliding common name returned for the victim's search.
+    - Compromise/leak of an SK intermediate or its keying
+      material (out of scope for THIS bug but in scope for
+      threat-model layering).
+    - Stolen/lost SK-issued certificate of a target organisation
+      reused before revocation propagation.
+
+  In all of these, the H1 bug (no TLS validation on LDAPS) is the
+  primary enabler — without it, none of the above attacker
+  capabilities are useful, because the attacker cannot place the
+  substituted certificate in front of the user in the first place.
+
+Conclusion: the root cause (Section 2) must be fixed regardless of
+the downstream warning, and the warning should ideally be hardened
+into a hard block when chain validation fails (no "Continue"
+button when there is no plausible recovery path for the user).
+
+
+--------------------------------------------------------------------------------
+7. LIMITATIONS / WHAT THIS BUG IS NOT
+--------------------------------------------------------------------------------
+
+  - Not remote code execution.
+  - Not a forgery of digital signatures (signature validation is
+    handled by libdigidocpp and is not affected by this bug).
+  - Not exploitable against the Windows code path of DigiDoc4 without
+    separate analysis (WinLDAP API, not OpenLDAP).
+  - Requires the attacker to occupy an on-path position; not a remote
+    unauthenticated CVE.
+
+These constraints are typical of MITM-class vulnerabilities and do not
+reduce severity for an application whose stated threat model includes
+on-path attackers (which any TLS-bearing security tool must).
+
+
+--------------------------------------------------------------------------------
+8. SUGGESTED FIX
+--------------------------------------------------------------------------------
+
+Minimal patch:
+
+    -#if 1
+    -    int cert_flag = LDAP_OPT_X_TLS_NEVER;
+    -    err = ldap_set_option(nullptr, LDAP_OPT_X_TLS_REQUIRE_CERT,
+    -                          &cert_flag);
+    -#else
+    -    err = ldap_set_option(nullptr, LDAP_OPT_X_TLS_CACERTFILE, "");
+    -#endif
+    +    int cert_flag = LDAP_OPT_X_TLS_DEMAND;
+    +    err = ldap_set_option(nullptr, LDAP_OPT_X_TLS_REQUIRE_CERT,
+    +                          &cert_flag);
+
+Recommended additional steps:
+
+  1. Load the CA bundle that already ships with the client (the same
+     trust list used by CheckConnection::sslConfiguration in
+     client/CheckConnection.cpp:105) and pass it via
+     LDAP_OPT_X_TLS_CACERTFILE, so verification works in App-Sandbox
+     and on systems with non-standard CA stores.
+
+  2. Pin the expected hostnames (esteid.ldap.sk.ee, k3.ldap.sk.ee,
+     ldap.eidpki.ee) by verifying SAN/CN, or apply public-key pinning
+     against the SK LDAP servers' certificate fingerprints (the SK
+     PKI is stable enough to make pinning realistic).
+
+  3. Audit the Windows path (Q_OS_WIN branch) for equivalent issues.
+     ldap_sslinit + LDAP_OPT_SERVER_CERTIFICATE callbacks should be
+     reviewed.
+
+  4. Harden the downstream "untrusted chain" warning in
+     client/dialogs/AddRecipients.cpp:202-215. When the leaf does
+     not chain to a trusted SK anchor, this should be a hard block
+     (no YES button) rather than a click-through, given that there
+     is no plausible recovery path for the user that does not
+     constitute the attack itself. This is defence-in-depth on top
+     of the LdapSearch fix, not a replacement.
+
+
+--------------------------------------------------------------------------------
+9. PROPOSED DISCLOSURE TIMELINE
+--------------------------------------------------------------------------------
+
+  Day 0      Private report submitted (today).
+  Day 7      Expected acknowledgement from CERT-EE / RIA.
+  Day 30     Expected status update / fix ETA.
+  Day 90     Public disclosure reference window. The 90-day timer is
+             the industry-standard reference, not a hard deadline.
+             If RIA needs additional time for testing, signing, and
+             staged rollout (Linux packages, macOS App Store, Windows
+             MSI), the window will be extended on reasonable request.
+
+  Earlier coordinated disclosure is preferred and welcomed.
+  A CVE assignment request will be initiated after acknowledgement,
+  unless RIA prefers to coordinate via the CVE Numbering Authority.
+
+Disclosure channels used:
+
+  1. cert@cert.ee — Estonian national CERT, primary channel.
+
+
+  GitHub Security Advisories are NOT available on the
+  open-eid/DigiDoc4-Client repository: the "Report a vulnerability"
+  button is missing and /security/advisories/new returns 404.
+
+
+--------------------------------------------------------------------------------
+10. ATTACHMENTS
+--------------------------------------------------------------------------------
+
+  poc-h1/
+    README.md           — reproduction instructions
+    gen-certs.sh        — generates TLS + attacker certificates
+    server.py           — fake LDAPS server (ldaptor)
+    Dockerfile          — container image
+    docker-compose.yml  — runs the server on 127.0.0.1:636
+    requirements.txt    — pinned Python deps (server)
+    decrypt.py          — CDOC1 decryptor (AES-CBC + AES-GCM, RSA-PKCS1v1.5
+                          + RSA-OAEP), depends only on `cryptography`
+    decrypt.sh          — convenience wrapper around decrypt.py
+    ADVISORY.txt        — this document
+
+Generated certificates and private keys are intentionally NOT included
+(see .gitignore). Run ./gen-certs.sh locally to regenerate.
+
+
+--------------------------------------------------------------------------------
+END OF ADVISORY
+--------------------------------------------------------------------------------

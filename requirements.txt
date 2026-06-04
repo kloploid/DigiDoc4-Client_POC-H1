@@ -1,0 +1,4 @@
+ldaptor==21.2.0
+twisted==24.3.0
+pyOpenSSL==24.1.0
+service-identity==24.1.0

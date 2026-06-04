@@ -1,0 +1,12 @@
+services:
+  fakeldap:
+    build: .
+    container_name: digidoc-poc-ldap
+    ports:
+      # 127.0.0.1:636 -> 636 in container.
+      # Docker Desktop on macOS handles the privileged port via its VM,
+      # no sudo needed on the host.
+      - "127.0.0.1:636:636"
+    volumes:
+      - ./certs:/data:ro
+    restart: "no"
